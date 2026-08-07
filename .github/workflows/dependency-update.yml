@@ -37,7 +37,7 @@ jobs:
 
       - name: Create issue for updates
         if: hashFiles('outdated-frontend.txt') != '' || hashFiles('outdated-backend.txt') != ''
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const fs = require('fs');
