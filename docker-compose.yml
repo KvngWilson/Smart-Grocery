@@ -1,0 +1,55 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: smart-grocery-redis
+    # Port mapping removed - Redis only accessible within Docker network
+    # This avoids conflicts with local Redis instances
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - smart-grocery-network
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    container_name: smart-grocery-server
+    ports:
+      - "5000:5000"
+    environment:
+      - NODE_ENV=production
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - smart-grocery-network
+    restart: unless-stopped
+
+  client:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    container_name: smart-grocery-client
+    ports:
+      - "80:80"
+    depends_on:
+      - server
+    networks:
+      - smart-grocery-network
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+    driver: local
+
+networks:
+  smart-grocery-network:
+    driver: bridge

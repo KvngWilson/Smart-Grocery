@@ -1,0 +1,15 @@
+apiVersion: v2
+name: smart-grocery
+description: A Helm chart for Smart Grocery Manager application
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+keywords:
+  - grocery
+  - react
+  - nodejs
+  - redis
+home: https://github.com/yourusername/smart-grocery
+maintainers:
+  - name: Smart Grocery Team
+    email: team@smartgrocery.com

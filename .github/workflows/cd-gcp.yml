@@ -1,0 +1,171 @@
+name: CD - Deploy to GCP
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - prod
+
+env:
+  GCP_REGION: us-central1
+  GKE_CLUSTER: smart-grocery-${{ github.event.inputs.environment || 'dev' }}-cluster
+  ENVIRONMENT: ${{ github.event.inputs.environment || 'dev' }}
+
+jobs:
+  build-and-push:
+    name: Build & Push Docker Images
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for GCR
+        run: gcloud auth configure-docker gcr.io
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push server image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./server
+          file: ./server/Dockerfile
+          push: true
+          tags: |
+            gcr.io/${{ secrets.GCP_PROJECT_ID }}/smart-grocery-server:latest
+            gcr.io/${{ secrets.GCP_PROJECT_ID }}/smart-grocery-server:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push client image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.client
+          push: true
+          tags: |
+            gcr.io/${{ secrets.GCP_PROJECT_ID }}/smart-grocery-client:latest
+            gcr.io/${{ secrets.GCP_PROJECT_ID }}/smart-grocery-client:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-to-gke:
+    name: Deploy to GKE
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Install gke-gcloud-auth-plugin
+        run: |
+          gcloud components install gke-gcloud-auth-plugin
+
+      - name: Get GKE credentials
+        run: |
+          gcloud container clusters get-credentials ${{ env.GKE_CLUSTER }} \
+            --region=${{ env.GCP_REGION }} \
+            --project=${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Update Kubernetes manifests with new image tags
+        run: |
+          cd k8s
+          sed -i "s|gcr.io/.*/smart-grocery-server:.*|gcr.io/${{ secrets.GCP_PROJECT_ID }}/smart-grocery-server:${{ github.sha }}|g" server-deployment.yaml
+          sed -i "s|gcr.io/.*/smart-grocery-client:.*|gcr.io/${{ secrets.GCP_PROJECT_ID }}/smart-grocery-client:${{ github.sha }}|g" client-deployment.yaml
+
+      - name: Deploy to Kubernetes
+        run: |
+          kubectl apply -k k8s/
+
+      - name: Wait for rollout to complete
+        run: |
+          kubectl rollout status deployment/server -n smart-grocery --timeout=5m
+          kubectl rollout status deployment/client -n smart-grocery --timeout=5m
+
+      - name: Verify deployment
+        run: |
+          kubectl get all -n smart-grocery
+          kubectl get ingress -n smart-grocery
+
+      - name: Get service endpoint
+        id: get-endpoint
+        run: |
+          EXTERNAL_IP=$(kubectl get svc client -n smart-grocery -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          echo "external_ip=$EXTERNAL_IP" >> $GITHUB_OUTPUT
+          echo "🚀 Application deployed to: http://$EXTERNAL_IP"
+
+    outputs:
+      external_ip: ${{ steps.get-endpoint.outputs.external_ip }}
+
+  smoke-test:
+    name: Smoke Test
+    runs-on: ubuntu-latest
+    needs: deploy-to-gke
+    if: needs.deploy-to-gke.outputs.external_ip != ''
+
+    steps:
+      - name: Wait for service to be ready
+        run: sleep 30
+
+      - name: Test API health
+        run: |
+          curl -f http://${{ needs.deploy-to-gke.outputs.external_ip }}/api/items || exit 1
+
+      - name: Test frontend
+        run: |
+          curl -f http://${{ needs.deploy-to-gke.outputs.external_ip }} || exit 1
+
+  notify:
+    name: Notify Deployment Status
+    runs-on: ubuntu-latest
+    needs: [deploy-to-gke, smoke-test]
+    if: always()
+
+    steps:
+      - name: Deployment Success
+        if: needs.smoke-test.result == 'success'
+        run: |
+          echo "✅ Deployment successful to ${{ env.ENVIRONMENT }}"
+          echo "🌐 Application URL: http://${{ needs.deploy-to-gke.outputs.external_ip }}"
+
+      - name: Deployment Failed
+        if: needs.smoke-test.result == 'failure' || needs.deploy-to-gke.result == 'failure'
+        run: |
+          echo "❌ Deployment failed to ${{ env.ENVIRONMENT }}"
+          exit 1
